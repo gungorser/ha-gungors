@@ -1,0 +1,105 @@
+set_pid_gain:
+  target:
+    entity:
+      integration: gungors
+      domain: climate
+  fields:
+    kp:
+      selector:
+        number:
+          mode: box
+          min: 0
+          max: 100000
+          step: any
+    ki:
+      selector:
+        number:
+          mode: box
+          min: 0
+          max: 100000
+          step: any
+    kd:
+      selector:
+        number:
+          mode: box
+          min: 0
+          max: 100000
+          step: any
+    ke:
+      selector:
+        number:
+          mode: box
+          min: 0
+          max: 100000
+          step: any
+
+set_pid_mode:
+  target:
+    entity:
+      integration: gungors
+      domain: climate
+  fields:
+    mode:
+      required: true
+      selector:
+        select:
+          options:
+            - auto
+            - "off"
+
+set_preset_temp:
+  target:
+    entity:
+      integration: gungors
+      domain: climate
+  fields:
+    away_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    away_temp_disable:
+      selector:
+        boolean:
+    eco_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    eco_temp_disable:
+      selector:
+        boolean:
+    boost_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    boost_temp_disable:
+      selector:
+        boolean:
+    comfort_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    comfort_temp_disable:
+      selector:
+        boolean:
+    home_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    home_temp_disable:
+      selector:
+        boolean:
+    sleep_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    sleep_temp_disable:
+      selector:
+        boolean:
+    activity_temp:
+      selector:
+        number: {mode: box, min: 0, max: 100, step: any}
+    activity_temp_disable:
+      selector:
+        boolean:
+
+clear_integral:
+  target:
+    entity:
+      integration: gungors
+      domain: climate
+
+reload:
