@@ -5,11 +5,11 @@
     "mqtt"
   ],
   "codeowners": [
-    "@gungors"
+    "@gungorser"
   ],
-  "documentation": "https://github.com/gungors/Customizations",
+  "documentation": "https://github.com/gungorser/ha-gungors",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/gungors/Customizations/issues",
+  "issue_tracker": "https://github.com/gungorser/ha-gungors/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
