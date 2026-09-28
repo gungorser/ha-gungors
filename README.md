@@ -3,7 +3,7 @@
 Home-grown Home Assistant integration (domain `gungors`): small platforms that patch gaps in
 otherwise-good integrations. Installed through HACS as a custom repository (category
 **Integration**). Platforms are configured in YAML (`climate: - platform: gungors`,
-`cover: - platform: gungors`); the YAML lives in the `harepo` repository (`packages/heating.yaml`,
+`cover: - platform: gungors`); the YAML lives in the `ha-configs` repository (`packages/heating.yaml`,
 `packages/covers.yaml`).
 
 | File | What it does |
