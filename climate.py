@@ -29,11 +29,12 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import CoreState, Event, EventStateChangedData, callback
+from homeassistant.core import CoreState, Event, EventStateChangedData, State, callback
 from homeassistant.helpers import entity_platform
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.reload import async_setup_reload_service
+from homeassistant.helpers.restore_state import RestoredExtraData
 
 # The original integration must be installed next to this one.
 from custom_components.smart_thermostat import const as st_const
@@ -69,6 +70,16 @@ ATTR_HVAC_MODE = "hvac_mode"
 ATTR_MIN_TEMP = "min_temp"
 ATTR_TARGET_TEMP_STEP = "target_temp_step"
 ATTR_HVAC_MODES = "hvac_modes"
+
+# Key in the extra restore data holding the last state written while available.
+# An unavailable state is stored without its attributes (setpoint, pid_i, ...), so
+# restoring from it after a restart would lose them.
+LAST_AVAILABLE_STATE = "last_available_state"
+
+# When the physical thermostat is switched on from OFF, wait (seconds) for it to
+# report the new mode before writing the setpoint. Some devices (e.g. EMS-ESP hc1)
+# store a setpoint received while still OFF as their "off temperature".
+PHYSICAL_MODE_WAIT = 10
 
 # `heater` as a dict: instead of writing the PID output to a heater entity
 # (e.g. an input_number), it is scaled onto the TRV valve opening/closing degrees.
@@ -243,6 +254,11 @@ class SyncThermostat(SmartThermostat):
         # to a heater input_number; drives hvac_action and the valve degrees.
         self._heater_value: int = 0
 
+        # This entity is only available while the physical thermostat is.
+        self._physical_available = False
+        # Last state written while available (see LAST_AVAILABLE_STATE).
+        self._last_available_state: dict[str, Any] | None = None
+
         self._physical_min_temp: float | None = None
         self._pre_off_target_temp: float | None = None
         self._startup_synced = False
@@ -258,6 +274,11 @@ class SyncThermostat(SmartThermostat):
     # ------------------------------------------------------------------ #
     async def async_added_to_hass(self):
         """Restore state, then start listening to the physical thermostat."""
+        # Known before the parent restores and runs its first control cycle.
+        self._physical_available = self._is_available_state(
+            self.hass.states.get(self._physical_entity_id)
+        )
+
         await super().async_added_to_hass()
 
         old_state = await self.async_get_last_state()
@@ -283,6 +304,35 @@ class SyncThermostat(SmartThermostat):
             self.hass.bus.async_listen_once(
                 EVENT_HOMEASSISTANT_START, self._async_on_ha_start
             )
+
+    async def async_get_last_state(self) -> State | None:
+        """Last stored state; if it was unavailable, the last available one instead."""
+        state = await super().async_get_last_state()
+        if state is None or state.state != STATE_UNAVAILABLE:
+            return state
+        extra = await self.async_get_last_extra_data()
+        snapshot = (extra.as_dict() if extra is not None else {}).get(
+            LAST_AVAILABLE_STATE
+        )
+        if not snapshot:
+            return state
+        restored = State.from_dict(snapshot)
+        if restored is None:
+            return state
+        # Keep carrying it in case we restart again before becoming available.
+        self._last_available_state = snapshot
+        return restored
+
+    @property
+    def extra_restore_state_data(self) -> RestoredExtraData | None:
+        """Store the last state written while available next to the regular one."""
+        if self.hass is not None and self.entity_id:
+            current = self.hass.states.get(self.entity_id)
+            if current is not None and current.state != STATE_UNAVAILABLE:
+                self._last_available_state = dict(current.as_dict())
+        if self._last_available_state is None:
+            return None
+        return RestoredExtraData({LAST_AVAILABLE_STATE: self._last_available_state})
 
     async def _async_on_ha_start(self, _event) -> None:
         await self._async_initial_push()
@@ -315,6 +365,74 @@ class SyncThermostat(SmartThermostat):
             self._pending_unsub = None
         self._pending = None
 
+    @callback
+    def _async_schedule_apply(self) -> None:
+        """(Re)start the cooling timer that applies the physical state to us."""
+        self._async_cancel_cooling_timer()
+        self._cooling_unsub = async_call_later(
+            self.hass, self._cooling_time, self._async_apply_physical
+        )
+
+    # ------------------------------------------------------------------ #
+    # Availability (follows the physical thermostat)
+    # ------------------------------------------------------------------ #
+    @property
+    def available(self) -> bool:
+        """Unavailable while the physical thermostat is missing or unavailable."""
+        return self._physical_available
+
+    @staticmethod
+    def _is_available_state(state: State | None) -> bool:
+        return state is not None and state.state != STATE_UNAVAILABLE
+
+    async def _async_control_heating(self, time_func=None, calc_pid=False):
+        """Pause the control loop (PID, heater, valves) while unavailable."""
+        if not self._physical_available:
+            return None
+        return await super()._async_control_heating(time_func, calc_pid)
+
+    async def _async_physical_became_unavailable(self) -> None:
+        """Stop syncing and put the heater in a safe (off) state."""
+        _LOGGER.warning(
+            "%s: %s is unavailable; pausing control",
+            self.entity_id,
+            self._physical_entity_id,
+        )
+        self._async_cancel_timers()
+        async with self._temp_lock:
+            # Don't integrate over the unavailable period once we resume.
+            self._previous_temp = None
+            self._previous_temp_time = None
+            if self._pid_controller is not None:
+                self._pid_controller.clear_samples()
+            try:
+                if self._heater_dict_mode:
+                    # The valves belong to the unreachable TRV: nothing to write.
+                    self._heater_value = 0
+                elif self._pwm:
+                    await self._async_heater_turn_off(force=True)
+                else:
+                    self._control_output = self._output_min
+                    await self._async_set_valve_value(self._control_output)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "%s: turning the heater off failed", self.entity_id
+                )
+        self.async_write_ha_state()
+
+    async def _async_physical_became_available(self) -> None:
+        """Resume: like at startup, our state is pushed to the physical thermostat."""
+        _LOGGER.info(
+            "%s: %s is available again; resuming control",
+            self.entity_id,
+            self._physical_entity_id,
+        )
+        self.async_write_ha_state()
+        if self.hass.state == CoreState.running:
+            self._startup_synced = False
+            await self._async_initial_push()
+        await self._async_control_heating(calc_pid=True)
+
     # ------------------------------------------------------------------ #
     # Properties
     # ------------------------------------------------------------------ #
@@ -341,14 +459,17 @@ class SyncThermostat(SmartThermostat):
     # Sync thermostat -> physical (no debounce)
     # ------------------------------------------------------------------ #
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set HVAC mode. OFF drops the target to min_temp; leaving OFF restores it."""
+        """Set HVAC mode. Leaving OFF restores the target from before OFF.
+
+        Entering OFF keeps the target as is: the physical thermostat reports its own
+        off setpoint (e.g. frost protection) and that value is then mirrored here.
+        """
         self._in_operation += 1
         try:
             previous = self._hvac_mode
             if hvac_mode == HVACMode.OFF and previous != HVACMode.OFF:
                 if self._target_temp is not None:
                     self._pre_off_target_temp = self._target_temp
-                self._target_temp = self.min_temp
             elif previous == HVACMode.OFF and hvac_mode != HVACMode.OFF:
                 if self._pre_off_target_temp is not None:
                     self._target_temp = self._pre_off_target_temp
@@ -399,18 +520,20 @@ class SyncThermostat(SmartThermostat):
         calls: list[tuple[str, dict[str, Any]]] = []
         expected_mode: str | None = None
         expected_temp: float | None = None
+        wait_for_mode = False
 
         if mode_str == HVACMode.OFF.value:
-            # Never write a setpoint while the TRV is off: it would turn it back on.
+            # Only the mode: the device applies its own off setpoint, which is then
+            # mirrored back. Never write a setpoint around OFF (it would either turn
+            # the device back on or overwrite its off temperature).
             if mode_supported and physical.state != HVACMode.OFF.value:
-                if temp_differs:
-                    calls.append((SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: target}))
                 calls.append((SERVICE_SET_HVAC_MODE, {ATTR_HVAC_MODE: mode_str}))
                 expected_mode = mode_str
         else:
             if mode_supported and physical.state != mode_str:
                 calls.append((SERVICE_SET_HVAC_MODE, {ATTR_HVAC_MODE: mode_str}))
                 expected_mode = mode_str
+                wait_for_mode = physical.state == HVACMode.OFF.value
             if temp_differs and (mode_supported or physical.state != HVACMode.OFF.value):
                 calls.append((SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: target}))
                 expected_temp = target
@@ -420,11 +543,44 @@ class SyncThermostat(SmartThermostat):
 
         self._async_clear_pending()
         self._pending = {"mode": expected_mode, "temp": expected_temp}
-        self._pending_unsub = async_call_later(
-            self.hass, PUSH_ECHO_TIMEOUT, self._async_pending_expired
-        )
         for service, data in calls:
             await self._async_call_physical(service, data)
+            if service == SERVICE_SET_HVAC_MODE and wait_for_mode and len(calls) > 1:
+                await self._async_wait_physical_mode(mode_str)
+        # Echo window starts once every command has been sent.
+        if self._pending is not None:
+            self._pending_unsub = async_call_later(
+                self.hass, PUSH_ECHO_TIMEOUT, self._async_pending_expired
+            )
+
+    async def _async_wait_physical_mode(self, mode: str) -> None:
+        """Wait until the physical thermostat reports `mode` (bounded)."""
+        state = self.hass.states.get(self._physical_entity_id)
+        if state is not None and state.state == mode:
+            return
+        reached = asyncio.Event()
+
+        @callback
+        def _check(event: Event[EventStateChangedData]) -> None:
+            new_state = event.data["new_state"]
+            if new_state is not None and new_state.state == mode:
+                reached.set()
+
+        unsub = async_track_state_change_event(
+            self.hass, [self._physical_entity_id], _check
+        )
+        try:
+            await asyncio.wait_for(reached.wait(), PHYSICAL_MODE_WAIT)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "%s: %s did not report %s within %ss; sending the setpoint anyway",
+                self.entity_id,
+                self._physical_entity_id,
+                mode,
+                PHYSICAL_MODE_WAIT,
+            )
+        finally:
+            unsub()
 
     async def _async_call_physical(self, service: str, data: dict[str, Any]) -> None:
         payload = {ATTR_ENTITY_ID: self._physical_entity_id, **data}
@@ -453,12 +609,20 @@ class SyncThermostat(SmartThermostat):
         """Physical thermostat changed: (re)start the cooling timer."""
         new_state = event.data["new_state"]
         old_state = event.data["old_state"]
-        if new_state is None:
+
+        if new_state is not None:
+            self._update_physical_min_temp(new_state)
+
+        available = self._is_available_state(new_state)
+        if available != self._physical_available:
+            self._physical_available = available
+            if available:
+                self.hass.async_create_task(self._async_physical_became_available())
+            else:
+                self.hass.async_create_task(self._async_physical_became_unavailable())
             return
 
-        self._update_physical_min_temp(new_state)
-
-        if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             return
 
         if not self._startup_synced:
@@ -469,6 +633,9 @@ class SyncThermostat(SmartThermostat):
             # Events right after our own write are echoes/intermediate values.
             if self._pending_matches(new_state):
                 self._async_clear_pending()
+                # The echo may carry values we did not command (e.g. the device's
+                # own off setpoint): read the device once it settles.
+                self._async_schedule_apply()
             return
 
         if old_state is not None and self._signature(old_state) == self._signature(
@@ -476,10 +643,7 @@ class SyncThermostat(SmartThermostat):
         ):
             return  # only e.g. current_temperature changed
 
-        self._async_cancel_cooling_timer()
-        self._cooling_unsub = async_call_later(
-            self.hass, self._cooling_time, self._async_apply_physical
-        )
+        self._async_schedule_apply()
 
     async def _async_apply_physical(self, _now) -> None:
         """Cooling time elapsed: read the physical entity and apply it verbatim."""
@@ -491,6 +655,7 @@ class SyncThermostat(SmartThermostat):
         mode = self._parse_physical_mode(physical.state)  # None for e.g. "auto"
         temp = self._parse_temp(physical.attributes.get(ATTR_TEMPERATURE))
 
+        changed = False
         self._in_operation += 1
         try:
             if mode is not None and mode != self._hvac_mode:
@@ -502,14 +667,17 @@ class SyncThermostat(SmartThermostat):
                     # Remember the target so a later heat from our side restores it.
                     self._pre_off_target_temp = self._target_temp
                 await super().async_set_hvac_mode(mode)
+                changed = True
             if temp is not None and (
                 self._target_temp is None
                 or abs(temp - self._target_temp) > TEMP_TOLERANCE
             ):
                 await super().async_set_temperature(**{ATTR_TEMPERATURE: temp})
+                changed = True
         finally:
             self._in_operation -= 1
-        self.async_write_ha_state()
+        if changed:
+            self.async_write_ha_state()
 
     # ------------------------------------------------------------------ #
     # Heater as valve mapping: internal heater value -> valve opening/closing

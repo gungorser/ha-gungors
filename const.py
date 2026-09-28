@@ -32,6 +32,18 @@ POSITION_TOLERANCE = 1
 # straight to the commanded target is treated as that echo and ignored.
 MAX_REAL_STEP = 5
 
+# --- timed_curtain cover type ---
+TYPE_TIMED_CURTAIN = "timed_curtain"
+CONF_INVERT = "invert"  # flip open/close and positions between room and motor
+CONF_Z2M_BASE_TOPIC = "z2m_base_topic"
+DEFAULT_TRAVEL_TIME = 10  # initial full-run time (s) per direction, then learned
+MIN_LEARN_DISTANCE = 30  # % a move must cover to update the learned time
+DEFAULT_Z2M_BASE_TOPIC = "zigbee2mqtt"
+ATTR_CALIBRATED = "calibrated"
+ATTR_POSITION_SOURCE = "position_source"  # "reported" | "estimated"
+ATTR_OPEN_TIME = "open_time"  # learned full-run times (s), room frame
+ATTR_CLOSE_TIME = "close_time"
+
 # --- climate: sync thermostat ---
 # `input_device`: the physical thermostat the sync thermostat is kept in sync with.
 CONF_INPUT_DEVICE = "input_device"

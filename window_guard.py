@@ -3,8 +3,9 @@
 Design summary (see gungors/Customizations README for the full writeup):
 
 - The wrapped ("raw") cover is the physical IKEA blind entity (e.g. a
-  Zigbee2MQTT cover). This entity shows a *setpoint* position instead of the
-  raw entity's position.
+  Zigbee2MQTT cover). At rest this entity shows a *setpoint* position; while
+  the blind is actually moving it shows the raw cover's real position, so the
+  position follows the movement.
 - Any position report from the raw cover that we did not ask for ourselves
   is treated as physical: the setpoint is snapped to it immediately, and
   `is_sync` stays true throughout.
@@ -12,7 +13,9 @@ Design summary (see gungors/Customizations README for the full writeup):
   voice, etc.) updates the setpoint. If the window is closed we forward the
   command to the raw cover immediately. If the window is open we hold the
   command: the raw cover is not touched, and `is_sync` becomes false until
-  the window closes.
+  the window closes. A held command keeps showing its setpoint.
+- The window is optional. Without one, commands are always forwarded and the
+  entity only adds direction tracking (below) on top of the raw blind.
 - Unbound physical buttons are handled by the pushbutton blueprint, which
   fires a `gungors_physical_cover` event for window_guard covers instead of
   calling cover services. This entity moves the raw cover on that event
@@ -24,10 +27,15 @@ Design summary (see gungors/Customizations README for the full writeup):
   only a slowly-changing position. This entity derives is_opening/is_closing
   from consecutive position reports so the UI and automations can use it,
   something the raw entity cannot offer.
+- A commanded move is finished once a report is within tolerance of the
+  target; the blind may still send a last report a moment later. Reports
+  within tolerance of the setpoint during `stop_silence` after that are
+  taken as settling, not as physical movement.
 """
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.cover import (
@@ -47,7 +55,7 @@ from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
 )
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.restore_state import RestoreEntity, RestoredExtraData
 
 from .const import (
     ATTR_ACTUAL_POSITION,
@@ -68,8 +76,13 @@ _PHYSICAL = "physical"
 _STOPPING = "stopping"  # we sent a stop; trailing reports are not physical
 
 
-def _window_is_open(hass: HomeAssistant, window_entity_id: str) -> bool:
-    """Return True if the window should be considered open (fail safe)."""
+def _window_is_open(hass: HomeAssistant, window_entity_id: str | None) -> bool:
+    """Return True if the window should be considered open (fail safe).
+
+    No window configured means there is nothing to guard: never open.
+    """
+    if window_entity_id is None:
+        return False
     state = hass.states.get(window_entity_id)
     if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
         return True
@@ -107,7 +120,7 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         name: str,
         unique_id: str,
         raw_cover_entity_id: str,
-        window_entity_id: str,
+        window_entity_id: str | None,
         start_timeout: float = DEFAULT_START_TIMEOUT,
         stop_silence: float = DEFAULT_STOP_SILENCE,
     ) -> None:
@@ -118,8 +131,8 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         self._start_timeout = start_timeout
         self._stop_silence = stop_silence
 
-        # Setpoint: what we show as current_cover_position and what we'll
-        # push to the raw cover once the window allows it.
+        # Setpoint: what we show at rest as current_cover_position and what
+        # we'll push to the raw cover once the window allows it.
         self._setpoint: int | None = None
 
         # Bookkeeping for the raw cover's real position/direction.
@@ -133,6 +146,10 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         self._commanded_target: int | None = None
         self._commanded_retried = False
 
+        # Until this monotonic time, reports near the setpoint are the blind
+        # settling after a finished commanded move, not physical movement.
+        self._settle_until = 0.0
+
         # A command is pending because the window was open when it was issued.
         self._pending_setpoint: int | None = None
 
@@ -140,6 +157,9 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         # command; resolved on the first valid raw position report.
         self._restored_pending = False
         self._baseline_needed = True
+
+        # The wrapper is only available while the raw cover is.
+        self._raw_available = False
 
         self._stall_unsub = None
         self._start_timeout_unsub = None
@@ -152,8 +172,22 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         await super().async_added_to_hass()
 
         last_state = await self.async_get_last_state()
-        if last_state is not None:
-            restored = last_state.attributes.get(ATTR_CURRENT_POSITION)
+        if last_state is None or last_state.state == STATE_UNAVAILABLE:
+            # Saved while unavailable (a state without attributes): use the
+            # extra restore data instead.
+            extra = await self.async_get_last_extra_data()
+            data = extra.as_dict() if extra is not None else {}
+            try:
+                self._setpoint = int(data["setpoint"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            self._restored_pending = data.get("pending") is True
+        else:
+            # The saved position may be a mid-move real position; the extra
+            # data holds the setpoint itself.
+            extra = await self.async_get_last_extra_data()
+            data = extra.as_dict() if extra is not None else {}
+            restored = data.get("setpoint", last_state.attributes.get(ATTR_CURRENT_POSITION))
             if restored is not None:
                 try:
                     self._setpoint = int(restored)
@@ -169,17 +203,21 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
                 self.hass, [self._raw_entity_id], self._handle_raw_state_change
             )
         )
-        self.async_on_remove(
-            async_track_state_change_event(
-                self.hass, [self._window_entity_id], self._handle_window_change
+        if self._window_entity_id is not None:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self._window_entity_id], self._handle_window_change
+                )
             )
-        )
 
         self.async_on_remove(
             self.hass.bus.async_listen(EVENT_PHYSICAL_COVER, self._handle_physical_event)
         )
 
         raw_state = self.hass.states.get(self._raw_entity_id)
+        self._raw_available = (
+            raw_state is not None and raw_state.state != STATE_UNAVAILABLE
+        )
         position = _position_of(raw_state)
         if position is not None:
             await self._establish_baseline(position)
@@ -214,6 +252,14 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
             ids = [ids]
         action = event.data.get("action")
         if self.entity_id in ids and action in ("open", "close"):
+            if not self._raw_available:
+                _LOGGER.debug(
+                    "%s: %s is unavailable, ignoring physical %s",
+                    self.entity_id,
+                    self._raw_entity_id,
+                    action,
+                )
+                return
             self.hass.async_create_task(self._handle_physical_button(action))
 
     async def _handle_physical_button(self, direction: str) -> None:
@@ -221,6 +267,7 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         self._movement_state = _PHYSICAL
         self._pending_setpoint = None  # physical decision overrides any held command
         self._commanded_target = None
+        self._settle_until = 0.0
         self._cancel_timers()
         if direction == "open":
             await self.hass.services.async_call(
@@ -237,7 +284,20 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
     # ------------------------------------------------------------------
 
     @property
+    def available(self) -> bool:
+        """Unavailable while the raw cover is missing or unavailable."""
+        return self._raw_available
+
+    @property
     def current_cover_position(self) -> int | None:
+        # While the blind moves, follow its real position; at rest (and for a
+        # command held by the window) show the setpoint.
+        if (
+            self._movement_state != _IDLE
+            and self._pending_setpoint is None
+            and self._actual_position is not None
+        ):
+            return self._actual_position
         return self._setpoint
 
     @property
@@ -254,18 +314,30 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
     def is_closing(self) -> bool:
         return self._movement_state != _IDLE and self._is_closing
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        is_sync = (
+    def _is_sync(self) -> bool:
+        return (
             self._pending_setpoint is None
             and self._actual_position is not None
             and self._setpoint is not None
             and abs(self._actual_position - self._setpoint) <= POSITION_TOLERANCE
         )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
         return {
-            ATTR_IS_SYNC: is_sync,
+            ATTR_IS_SYNC: self._is_sync(),
             ATTR_ACTUAL_POSITION: self._actual_position,
         }
+
+    @property
+    def extra_restore_state_data(self) -> RestoredExtraData:
+        """Setpoint and pending flag, for a restart (also while unavailable)."""
+        return RestoredExtraData(
+            {
+                "setpoint": self._setpoint,
+                "pending": self._restored_pending or not self._is_sync(),
+            }
+        )
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         await self._async_request_position(100)
@@ -281,6 +353,7 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         # settles on wherever the blind actually stops (see _handle_stall).
         self._pending_setpoint = None
         self._commanded_target = None
+        self._settle_until = 0.0
         self._cancel_timers()
         self._movement_state = _STOPPING
         self._is_opening = False
@@ -300,6 +373,7 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
     async def _async_request_position(self, target: int) -> None:
         target = max(0, min(100, target))
         self._setpoint = target
+        self._settle_until = 0.0
         self.async_write_ha_state()
 
         if _window_is_open(self.hass, self._window_entity_id):
@@ -346,6 +420,9 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         new_state = event.data.get("new_state")
         if new_state is None:
             return
+        if not self._raw_available:
+            # A held setpoint stays held; it is resolved when the raw cover returns.
+            return
         window_open = _window_is_open(self.hass, self._window_entity_id)
 
         if window_open and self._movement_state == _COMMANDED:
@@ -376,7 +453,24 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
 
     @callback
     def _handle_raw_state_change(self, event: Event) -> None:
-        position = _position_of(event.data.get("new_state"))
+        new_state = event.data.get("new_state")
+        available = new_state is not None and new_state.state != STATE_UNAVAILABLE
+        if available != self._raw_available:
+            self._raw_available = available
+            if not available:
+                self._handle_raw_unavailable()
+                return
+            # Back from unavailable: like at startup, the first valid position
+            # decides the setpoint; a command held for the window survives.
+            _LOGGER.info(
+                "%s: %s is available again", self.entity_id, self._raw_entity_id
+            )
+            self._baseline_needed = True
+            self._restored_pending = self._pending_setpoint is not None
+            self._pending_setpoint = None
+            self.async_write_ha_state()
+
+        position = _position_of(new_state)
         if position is None:
             return
 
@@ -431,11 +525,24 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         if self._movement_state == _IDLE and position == previous:
             return  # attribute-only update, nothing moved
 
+        if (
+            self._movement_state == _IDLE
+            and self._setpoint is not None
+            and time.monotonic() < self._settle_until
+            and abs(position - self._setpoint) <= POSITION_TOLERANCE
+        ):
+            # Last report of a finished commanded move: settle, not physical.
+            self._setpoint = position
+            self._last_reported_position = position
+            self.async_write_ha_state()
+            return
+
         # Not something we commanded: physical movement (bound button, unbound
         # button, or anything else moving the raw entity). Physical wins:
         # setpoint follows and any held remote command is dropped.
         self._movement_state = _PHYSICAL
         self._pending_setpoint = None
+        self._settle_until = 0.0
         self._setpoint = position
         if previous is not None and position != previous:
             self._is_opening = position > previous
@@ -444,12 +551,26 @@ class WindowGuardedCover(CoverEntity, RestoreEntity):
         self._arm_stall_timer()
         self.async_write_ha_state()
 
+    def _handle_raw_unavailable(self) -> None:
+        """Raw cover dropped: drop the in-flight move, keep a held setpoint."""
+        _LOGGER.warning(
+            "%s: %s is unavailable", self.entity_id, self._raw_entity_id
+        )
+        self._cancel_timers()
+        self._commanded_target = None
+        self._movement_state = _IDLE
+        self._is_opening = False
+        self._is_closing = False
+        self._settle_until = 0.0
+        self.async_write_ha_state()
+
     def _finish_move(self, final_position: int) -> None:
         self._setpoint = final_position
         self._movement_state = _IDLE
         self._is_opening = False
         self._is_closing = False
         self._commanded_target = None
+        self._settle_until = time.monotonic() + self._stop_silence
         self._cancel_timers()
         self.async_write_ha_state()
 
